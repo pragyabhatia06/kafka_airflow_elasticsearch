@@ -1,0 +1,8 @@
+flask
+pymongo
+feedparser
+requests
+python-dotenv
+gunicorn
+kafka-python
+elasticsearch==8.15.1

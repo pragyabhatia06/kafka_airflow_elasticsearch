@@ -1,140 +1,490 @@
-# Data Engineering Project 
-[![Build Status](https://travis-ci.com/damklis/DataEngineeringProject.svg?branch=master)](https://travis-ci.org//damklis/DataEngineeringProject) [![Coverage Status](https://coveralls.io/repos/github/damklis/DataEngineeringProject/badge.svg?branch=master)](https://coveralls.io/github/damklis/DataEngineeringProject?branch=master) [![Python 3.8](https://img.shields.io/badge/python-3.8-blue.svg)](https://www.python.org/downloads/release/python-360/)
+# Real-Time RSS News Data Pipeline
 
+This project ingests RSS news feeds, publishes articles to Kafka, stores them in MongoDB, indexes them into Elasticsearch, and exposes the stored news through a Flask API. Apache Airflow orchestrates the ingestion pipeline on a schedule.
 
-**Data Engineering Project** is an implementation of the data pipeline which consumes the latest news from RSS Feeds and makes them available for users via handy API.
-The pipeline infrastructure is built using popular, open-source projects.
+## Overview
 
-**Access the latest news and headlines in one place.** :muscle:
+The pipeline fetches RSS feeds from multiple sources, normalizes the articles, and sends them through Kafka so that multiple downstream consumers can process the same stream independently.
 
-<!-- TABLE OF CONTENTS -->
-## Table of Contents
+Current sources:
 
-* [Architecture diagram](#architecture-diagram)
-* [How it works](#how-it-works)
-    * [Data scraping](#data-scraping)
-    * [Data flow](#data-flow)
-    * [Data access](#data-access)
-* [Prerequisites](#prerequisites)
-* [Running project](#running-project)
-* [Testing](#testing)
-* [API service](#api-service)
-* [References](#references)
-* [Contributions](#contributions)
-* [License](#license)
-* [Contact](#contact)
+- BBC News RSS
+- Sky News RSS
 
-<!-- ARCHITECTURE DIAGRAM -->
-## Architecture diagram
+Current outputs:
 
-![MVP Architecture](./images/architecture_diagram.png)
+- MongoDB for durable document storage and API reads
+- Elasticsearch for search-oriented indexing
 
+## Architecture
 
-<!-- HOW IT WORKS -->
-## How it works
+```text
+RSS Feeds
+   |
+   v
+scraper/rss_fetcher.py
+   |
+   v
+scraper/producer.py
+   |
+   v
+Kafka topic: rss_news_raw
+   |                     \
+   |                      \
+   v                       v
+consumers/mongo_consumer.py  consumers/elastic_consumer.py
+   |                       |
+   v                       v
+MongoDB                 Elasticsearch
+   |
+   v
+Flask API
 
-#### Data Scraping
-Airflow DAG is responsible for the execution of Python scraping modules.
-It runs periodically every X minutes producing micro-batches.
-- First task updates **proxypool**. Using proxies in combination with rotating user agents can help get scrapers past most of the anti-scraping measures and prevent being detected as a scraper.
-
-- Second task extracts news from RSS feeds provided in the configuration file, validates the quality and sends data into **Kafka topic A**. The extraction process is using validated proxies from **proxypool**.
-
-#### Data flow
-- Kafka Connect **Mongo Sink** consumes data from **Kafka topic A** and stores news in MongoDB using upsert functionality based on **_id** field.
-- **Debezium MongoDB Source** tracks a MongoDB replica set for document changes in databases and collections, recording those changes as events in **Kafka topic B**.
-- Kafka Connect **Elasticsearch Sink** consumes data from **Kafka topic B** and upserts news in Elasticsearch. Data replicated between topics **A** and **B** ensures MongoDB and ElasticSearch synchronization. Command Query Responsibility Segregation (CQRS) pattern allows the use of separate models for updating and reading information.
-- Kafka Connect **S3-Minio Sink** consumes records from **Kafka topic B** and stores them in MinIO (high-performance object storage) to ensure data persistency.
-
-#### Data access
-- Data gathered by previous steps can be easily accessed in [API service](api)  using public endpoints.
-
-<!-- PREREQUISITES -->
-## Prerequisites
-Software required to run the project. Install:
-- [Docker](https://docs.docker.com/get-docker/) - You must allocate a minimum of 8 GB of Docker memory resource.
-- [Python 3.8+ (pip)](https://www.python.org/)
-- [docker-compose](https://docs.docker.com/compose/install/)
-
-<!-- RUNNING PROJECT -->
-## Running project
-Script `manage.sh` - wrapper for `docker-compose` works as a managing tool.
-
-- Build project infrastructure
-```sh
-./manage.sh up
+Airflow scheduler triggers the producer every 10 minutes.
 ```
 
-- Stop project infrastructure
-```sh
-./manage.sh stop
+## Key Features
+
+- Scheduled RSS ingestion with Airflow
+- Kafka-based decoupled processing
+- MongoDB upsert pipeline with unique article IDs
+- Elasticsearch indexing for search use cases
+- Flask API for reading ingested articles
+- Docker Compose based local development setup
+- Retry logic for Kafka, MongoDB, and Elasticsearch connectivity
+
+## Tech Stack
+
+- Python 3.11
+- Flask
+- Apache Airflow 2.10
+- Kafka + Zookeeper
+- MongoDB
+- Elasticsearch 8.15
+- Docker Compose
+
+## Project Structure
+
+```text
+.
+├── airflow/
+│   └── dags/
+│       └── rss_pipeline_dag.py
+├── api/
+│   ├── __init__.py
+│   ├── app.py
+│   └── rss.py
+├── consumers/
+│   ├── __init__.py
+│   ├── elastic_consumer.py
+│   └── mongo_consumer.py
+├── scraper/
+│   ├── __init__.py
+│   ├── load_to_mongo.py
+│   ├── producer.py
+│   └── rss_fetcher.py
+├── docker-compose.yml
+├── dockerfile
+├── requirements.txt
+└── .env
 ```
 
-- Delete project infrastructure
-```sh
-./manage.sh down
+## How the Pipeline Works
+
+### 1. Fetch
+
+The RSS fetcher retrieves articles from configured feed URLs and builds normalized records with these fields:
+
+- article_id
+- source
+- title
+- link
+- published_at
+- summary
+- loaded_at
+
+`article_id` is generated from the article URL using an MD5 hash, which allows idempotent upserts in downstream systems.
+
+### 2. Publish
+
+The producer publishes each article to Kafka topic `rss_news_raw`.
+
+Producer behavior:
+
+- retries Kafka connection on startup
+- sends JSON-serialized article payloads
+- waits for broker acknowledgment
+- logs per-run success and failure counts
+
+### 3. Consume to MongoDB
+
+The MongoDB consumer reads from Kafka and upserts documents into MongoDB collection `raw_articles`.
+
+Mongo consumer behavior:
+
+- creates useful indexes
+- upserts by `article_id`
+- avoids duplicate records across re-runs
+- logs insert/modify/match counts
+
+### 4. Consume to Elasticsearch
+
+The Elasticsearch consumer reads the same Kafka topic and indexes the records into Elasticsearch index `news_articles`.
+
+Elasticsearch consumer behavior:
+
+- waits for Elasticsearch readiness
+- creates index mappings if missing
+- normalizes date values before indexing
+- logs successful indexing events
+
+### 5. Serve via API
+
+The Flask API reads data from MongoDB and exposes read endpoints for health checks and article retrieval.
+
+## Services
+
+The Docker Compose stack includes the following services:
+
+| Service | Purpose | Port |
+|---|---|---|
+| `mongo` | Stores ingested articles | `27017` |
+| `api` | Flask API server | `5000` |
+| `airflow-db` | Airflow metadata database | `5433` |
+| `airflow-init` | Initializes Airflow DB and admin user | none |
+| `airflow-webserver` | Airflow UI | `8080` |
+| `airflow-scheduler` | Runs DAG schedule | none |
+| `zookeeper` | Kafka coordination | none |
+| `kafka` | Message broker | `9092` |
+| `mongo-consumer` | Persists Kafka messages into MongoDB | none |
+| `elasticsearch` | Search index engine | `9200` |
+| `elastic-consumer` | Persists Kafka messages into Elasticsearch | none |
+
+## Environment Variables
+
+The project uses the following environment variables from `.env`:
+
+```env
+MONGO_URI=mongodb://mongo:27017/
+MONGO_DB=news_db
+MONGO_COLLECTION=raw_articles
+
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+KAFKA_TOPIC=rss_news_raw
+KAFKA_CONSUMER_GROUP=mongo-news-consumer-group
+
+ELASTICSEARCH_HOST=http://elasticsearch:9200
+ELASTICSEARCH_INDEX=news_articles
+ELASTIC_CONSUMER_GROUP=elastic-news-consumer-group
 ```
 
-<!-- TESTING -->
-## Testing
-Script `run_tests.sh` executes unit tests against Airflow scraping modules and Django Rest Framework applications.
+## Running the Project
 
-```sh
-./run_tests.sh
+### Prerequisites
+
+- Docker Desktop or Docker Engine with Compose support
+- At least 4 GB of memory available for local containers
+
+### Start the Stack
+
+From the project root:
+
+```bash
+docker compose up --build
 ```
 
+To run in detached mode:
 
-<!-- API -->
-## API service
-Read detailed [documentation](api) on how to interact with data collected by pipeline using **search** endpoints.
-
-Example searches:
-- see all news
-```
-http://127.0.0.1:5000/api/v1/news/ 
-```
--  add `search_fields` title and description, see all of the news containing the `Robert Lewandowski` phrase
-```
-http://127.0.0.1:5000/api/v1/news/?search=Robert%20Lewandowski 
+```bash
+docker compose up -d --build
 ```
 
-- find news containing the `Lewandowski` phrase in their titles
+### Airflow Access
 
-```
-http://127.0.0.1:5000/api/v1/news/?search=title|Lewandowski 
-```
+Open Airflow at:
 
-- see all of the polish news containing the `Lewandowski` phrase
-
-```
-http://127.0.0.1:5000/api/v1/news/?search=lewandowski&language=pl
+```text
+http://localhost:8080
 ```
 
-<!-- REFERENCES -->
-## References
-Inspired by following codes, articles and videos:
+Default admin credentials configured by the stack:
 
-* [How we launched a data product in 60 days with AWS](https://towardsdatascience.com/launching-beta-data-product-within-two-month-with-aws-6ac6b55a9b5d)
-* [Toruń JUG #55 - "Kafka Connect - szwajcarski scyzoryk w rękach inżyniera?" - Mariusz Strzelecki](https://www.youtube.com/watch?v=iiz6t8g5t6Q)
-* [Kafka Elasticsearch Sink Connector and the Power of Single Message Transformations](https://sap1ens.com/blog/2020/05/23/kafka-elasticsearch-sink-connector-and-the-power-of-single-message-transformations/)
-* [Docker Tips and Tricks with Kafka Connect, ksqlDB, and Kafka](https://rmoff.net/2018/12/15/docker-tips-and-tricks-with-kafka-connect-ksqldb-and-kafka/)
+- Username: `admin`
+- Password: `admin`
 
-<!-- CONTRIBUTIONS -->
-## Contributions
-Contributions are what makes the open-source community such an amazing place to learn, inspire, and create. Any contributions you make are greatly appreciated.
+### API Access
 
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+Open the API at:
 
-<!-- LICENSE -->
-## License
-Distributed under the MIT License. See [LICENSE](LICENSE) for more information.
+```text
+http://localhost:5000
+```
 
+### Elasticsearch Access
 
-<!-- CONTACT -->
-## Contact
-Please feel free to contact me if you have any questions.
-[Damian Kliś](https://www.linkedin.com/in/klisdamian/) [@DamianKlis](https://twitter.com/DamianKlis)
+Open Elasticsearch at:
+
+```text
+http://localhost:9200
+```
+
+## Airflow DAG
+
+The main DAG is:
+
+- DAG ID: `rss_to_kafka_pipeline`
+
+Schedule:
+
+- Every 10 minutes
+
+Task:
+
+- `publish_rss_news`
+
+Notes:
+
+- Airflow may show the DAG as paused on first startup depending on metadata state.
+- If the DAG is paused, unpause it before expecting scheduled ingestion.
+
+Useful commands:
+
+```bash
+docker compose exec airflow-webserver airflow dags list
+docker compose exec airflow-webserver airflow dags unpause rss_to_kafka_pipeline
+docker compose exec airflow-webserver airflow dags trigger rss_to_kafka_pipeline
+```
+
+## API Endpoints
+
+### Health Check
+
+```http
+GET /health
+```
+
+Example:
+
+```bash
+curl http://localhost:5000/health
+```
+
+Response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### Get Latest News
+
+```http
+GET /news
+```
+
+Optional query parameters:
+
+- `source`: filter by source name
+- `limit`: number of articles to return, between 1 and 100
+
+Examples:
+
+```bash
+curl "http://localhost:5000/news"
+curl "http://localhost:5000/news?limit=5"
+curl "http://localhost:5000/news?source=BBC&limit=10"
+```
+
+### Get Article by ID
+
+```http
+GET /news/<article_id>
+```
+
+Example:
+
+```bash
+curl "http://localhost:5000/news/be49b0ce372a3ae8a89cc64c3ea60b1f"
+```
+
+## Verifying the Pipeline
+
+### Check Running Services
+
+```bash
+docker compose ps
+```
+
+### Check MongoDB Document Count
+
+```bash
+docker compose exec mongo mongosh --quiet --eval "db.getSiblingDB('news_db').raw_articles.countDocuments()"
+```
+
+### Check Elasticsearch Document Count
+
+```bash
+docker compose exec elasticsearch curl -s http://localhost:9200/news_articles/_count
+```
+
+### Inspect Kafka/Mongo/Elasticsearch Logs
+
+```bash
+docker compose logs --tail=100 kafka
+docker compose logs --tail=100 mongo-consumer
+docker compose logs --tail=100 elastic-consumer
+docker compose logs --tail=100 airflow-scheduler
+```
+
+## Sample End-to-End Workflow
+
+1. Start the stack.
+2. Open Airflow UI at `http://localhost:8080`.
+3. Confirm `rss_to_kafka_pipeline` exists.
+4. Unpause the DAG if needed.
+5. Trigger a manual DAG run for immediate ingestion.
+6. Confirm records appear in MongoDB.
+7. Confirm records appear in Elasticsearch.
+8. Call the Flask API to retrieve articles.
+
+## Data Model
+
+Each article record follows this shape:
+
+```json
+{
+  "article_id": "string",
+  "source": "BBC",
+  "title": "Article title",
+  "link": "https://...",
+  "published_at": "Thu, 12 Mar 2026 15:09:00 +0000",
+  "summary": "Short summary",
+  "loaded_at": "2026-03-12T19:20:12.498498+00:00"
+}
+```
+
+## Local Development Notes
+
+### Docker Image
+
+The project image is built from `python:3.11-slim` and installs dependencies from `requirements.txt`.
+
+Default container command:
+
+```text
+gunicorn --bind 0.0.0.0:5000 api.app:app
+```
+
+### Python Dependencies
+
+Main dependencies:
+
+- `flask`
+- `pymongo`
+- `feedparser`
+- `requests`
+- `python-dotenv`
+- `gunicorn`
+- `kafka-python`
+- `elasticsearch==8.15.1`
+
+## Troubleshooting
+
+### No News Appears in MongoDB or API
+
+Check the following:
+
+1. The stack is running:
+
+```bash
+docker compose ps
+```
+
+2. The Airflow DAG is not paused:
+
+```bash
+docker compose exec airflow-webserver airflow dags list
+```
+
+3. Trigger the DAG manually:
+
+```bash
+docker compose exec airflow-webserver airflow dags trigger rss_to_kafka_pipeline
+```
+
+4. Inspect producer and consumer logs:
+
+```bash
+docker compose logs --tail=100 airflow-scheduler
+docker compose logs --tail=100 mongo-consumer
+```
+
+### Kafka Consumer Cannot Connect
+
+Check:
+
+- `kafka` service is up
+- `zookeeper` service is up
+- broker is listening on `kafka:9092`
+
+Useful command:
+
+```bash
+docker compose logs --tail=100 kafka
+```
+
+### Elasticsearch Index Is Empty
+
+Check:
+
+1. Elasticsearch is running:
+
+```bash
+docker compose ps elasticsearch elastic-consumer
+```
+
+2. The consumer is healthy:
+
+```bash
+docker compose logs --tail=100 elastic-consumer
+```
+
+3. The index count:
+
+```bash
+docker compose exec elasticsearch curl -s http://localhost:9200/news_articles/_count
+```
+
+### Airflow Starts but Pipeline Does Not Run Automatically
+
+Possible causes:
+
+- DAG paused in metadata
+- scheduler restarted before DAG state settled
+- ingestion window has not reached the next 10-minute interval
+
+Use a manual trigger to verify the pipeline immediately.
+
+## Deprecated Component
+
+`scraper/load_to_mongo.py` is kept only as a backward-compatible direct insert path. The primary pipeline is Kafka-based and should be preferred.
+
+## Current Status
+
+The project currently supports:
+
+- scheduled feed ingestion
+- MongoDB persistence
+- Elasticsearch indexing
+- API retrieval from MongoDB
+- local orchestration with Docker Compose
+
+## Possible Next Enhancements
+
+- Add full-text search API backed by Elasticsearch
+- Add Swagger or OpenAPI documentation
+- Add unit and integration tests
+- Add health checks in Docker Compose
+- Build a custom Airflow image instead of installing packages at startup
+- Add dashboards and monitoring
